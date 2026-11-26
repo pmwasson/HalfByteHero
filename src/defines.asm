@@ -104,6 +104,7 @@ GCRESET 		:= $C070 	; Reset the game controllers.
 ; 2GS
 NEWVIDEO        := $C029 	; New Video: 129=SHR, 1=None, Bit 6=Linearize, Bit 5=BW
 CLOCKCTL        := $C034    ; b0-3=borderColor b5=stopBit b6=read b7=start
+SHADOW          := $C035    ; Shadow register, bit 5=inhibit text page 2 (ROM 3)
 
 ; ROM routines
 ;---------------------------------------------------------
@@ -124,6 +125,8 @@ MON             := $FF65    ; Enter monitor (BRK)
 MONZ            := $FF69    ; Enter monitor
 WAIT            := $FCA8    ; Wait 0.5*(26 + 27*A + 5*A*A) microseconds
 PREAD           := $FB1E    ; Read paddle X (0=hor,1=vert on joystick), result in Y
+IDROUTINE       := $FE1F    ; SEC, JSR: carry clear on IIgs (RTS on 8-bit machines)
+ROMID_FBC0      := $FBC0    ; $EA=IIe, $E0=enhanced IIe/IIgs, $00=IIc
 
 ; PRODOS
 ;---------------------------------------------------------

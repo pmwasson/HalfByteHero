@@ -4,6 +4,7 @@ cd ..\build
 :: Convert images
 ::---------------------------------------------------------------------------
 python3 ..\scripts\imageConvert.py ..\images\title.png title.png >  ..\build\title.asm  || exit
+python3 ..\scripts\imageConvert.py --level ..\images\level1.png level1.png >  ..\build\level1.asm  || exit
 
 ::---------------------------------------------------------------------------
 :: Compile code
@@ -11,8 +12,8 @@ python3 ..\scripts\imageConvert.py ..\images\title.png title.png >  ..\build\tit
 ::---------------------------------------------------------------------------
 
 :: Half Byte Hero
-ca65 -I ..\src -t apple2 ..\src\game.asm -l game.dis -o ..\build\game.o || exit
-cl65 -I ..\src -t apple2 -u __EXEHDR__ ..\src\game.asm apple2.lib  -o hbh.apple2 -C ..\src\start2000.cfg || exit
+ca65 -I ..\src -I ..\build -t apple2 ..\src\game.asm -l game.dis -o ..\build\game.o || exit
+cl65 -I ..\src --asm-include-dir ..\build -t apple2 -u __EXEHDR__ ..\src\game.asm apple2.lib  -o hbh.apple2 -C ..\src\start2000.cfg || exit
 
 ::---------------------------------------------------------------------------
 :: Build disk

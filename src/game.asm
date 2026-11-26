@@ -16,6 +16,9 @@
 
 .proc   main
 
+    jsr     initMachine
+    jsr     initObjects
+
     ldx     #PLAYER_START_X
     ldy     #PLAYER_START_Y
     jsr     playerInit
@@ -42,8 +45,8 @@
 ; Draw a full frame on the hidden page, wait for vsync, then show it
 ; and switch to drawing the other page. Loops forever.
 ;
-; Order per page: input, player update, scroll to the player, background,
-; then draw the player on top.
+; Order per page: input, objects, player update, scroll to the player,
+; background, then draw the player on top.
 ;-----------------------------------------------------------------------------
 
 .proc   gameLoop
@@ -51,6 +54,7 @@
 loop:
     ; Draw page 1 (page 2 is showing)
     jsr     readInput
+    jsr     moveObjects
     jsr     playerUpdate
     jsr     updateScrollOffset
     jsr     drawScreen1
@@ -62,6 +66,7 @@ loop:
 
     ; Draw page 2 (page 1 is showing)
     jsr     readInput
+    jsr     moveObjects
     jsr     playerUpdate
     jsr     updateScrollOffset
     jsr     drawScreen2
@@ -95,25 +100,89 @@ loop:
 .endproc
 
 ;-----------------------------------------------------------------------------
+; initMachine
+;
+; Detect IIe / IIc / IIgs (sets machineType) and set up for waitVBL
+;   IIgs: slow to 1MHz (paddle taps are cycle counted) and turn on
+;         text page 2 shadowing (needed for low-res page 2)
+;   IIc:  enable the VBL interrupt so RDVBLBAR latches it. CPU
+;         interrupts are masked so it is never actually taken.
+;-----------------------------------------------------------------------------
+
+.proc   initMachine
+
+    ; ID routine clears carry on a IIgs, is an RTS on 8-bit machines
+    sec
+    jsr     IDROUTINE
+    bcs     notGS
+
+    lda     #MACHINE_IIGS
+    sta     machineType
+
+    lda     CYAREG
+    and     #%01111111          ; bit 7 = 0 for 1MHz
+    sta     CYAREG
+
+    lda     SHADOW
+    and     #%11011111          ; bit 5 = 0 to shadow text page 2
+    sta     SHADOW
+    rts
+
+notGS:
+    lda     ROMID_FBC0
+    bne     done                ; IIe (machineType defaults to MACHINE_IIE)
+
+    lda     #MACHINE_IIC
+    sta     machineType
+
+    sei                         ; latch the VBL interrupt, never take it
+    sta     IOUDISOFF           ; enable access to IOU
+    sta     ENVBL               ; enable VBL interrupt
+    sta     IOUDISON            ; disable access to IOU
+    bit     PTRIG               ; clear any pending VBL flag
+
+done:
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
 ; waitVBL
 ;
-; Wait for the start of vertical blank FRAMES_PER_TICK times
-; (Apple IIe: RDVBLBAR bit 7 is 0 during vertical blank)
+; Wait for the start of vertical blank
+;   IIe:  RDVBLBAR bit 7 is 0 during vertical blank
+;   IIgs: RDVBLBAR bit 7 is 1 during vertical blank (inverted)
+;   IIc:  RDVBLBAR bit 7 is set by the VBL interrupt and cleared by
+;         reading PTRIG ($C070), which drawScreen1/2 do every frame
+;         when they start the paddle timer
 ;-----------------------------------------------------------------------------
 
 .proc   waitVBL
 
-    ldx     #FRAMES_PER_TICK
+    lda     machineType
+    beq     iie
+    cmp     #MACHINE_IIGS
+    beq     iigs
 
-frame:
-waitDisplay:
+iic:
     lda     RDVBLBAR
-    bpl     waitDisplay         ; in blank, wait for it to end
-waitBlank:
+    bpl     iic                 ; wait for VBL interrupt flag
+    rts
+
+iie:
     lda     RDVBLBAR
-    bmi     waitBlank           ; drawing, wait for blank to start
-    dex
-    bne     frame
+    bpl     iie                 ; in blank, wait for it to end
+iieBlank:
+    lda     RDVBLBAR
+    bmi     iieBlank            ; drawing, wait for blank to start
+    rts
+
+iigs:
+    lda     RDVBLBAR
+    bmi     iigs                ; in blank, wait for it to end
+iigsBlank:
+    lda     RDVBLBAR
+    bpl     iigsBlank           ; drawing, wait for blank to start
     rts
 
 .endproc
@@ -123,7 +192,7 @@ waitBlank:
 ;
 ; Copy inputState to inputPrev, then read the new held state
 ;   Jump        = button 0 (or open-apple)
-;   Left/right  = joystick X axis
+;   Left/right  = joystick X axis, sampled during the last drawScreen
 ;-----------------------------------------------------------------------------
 
 .proc   readInput
@@ -139,22 +208,41 @@ waitBlank:
     sta     inputState
 
 checkStick:
-    ldx     #0
-    jsr     PREAD               ; Y = paddle 0 (0..255)
-    cpy     #STICK_LEFT
-    bcs     notLeft
+    ldx     paddleTaps          ; 0 = left, 1 = middle, 2 = right
     lda     inputState
-    ora     #INPUT_LEFT
+    ora     paddleInput,x
     sta     inputState
     rts
 
-notLeft:
-    cpy     #STICK_RIGHT
-    bcc     done
-    lda     inputState
-    ora     #INPUT_RIGHT
-    sta     inputState
-done:
+.endproc
+
+;-----------------------------------------------------------------------------
+; paddleTap
+;
+; Called from drawScreen1/2 at pass PADDLE_TAP_1 and PADDLE_TAP_2 (in X)
+; Counts how many taps the paddle 0 timer is still running, then sets
+; tapCompare to the next tap (or 40 to finish the loop)
+; Preserves X and Y, clobbers A
+;
+; The paddle timer runs about 11 cycles per paddle unit (0..255), so
+; tap 1 at ~1/3 (paddle 85, ~935 cycles) and tap 2 at ~2/3 (paddle 170,
+; ~1870 cycles). Each drawScreen pass is 235 cycles:
+;   tap 1 = 935 / 235 = 4 passes, tap 2 = 1870 / 235 = 8 passes
+;-----------------------------------------------------------------------------
+
+.proc   paddleTap
+
+    lda     GC0                 ; bit 7 set while timer still running
+    bpl     timerDone
+    inc     paddleTaps
+timerDone:
+
+    lda     #40                 ; after tap 2, finish the loop
+    cpx     #PADDLE_TAP_1
+    bne     setCompare
+    lda     #PADDLE_TAP_2       ; after tap 1, go to tap 2
+setCompare:
+    sta     tapCompare
     rts
 
 .endproc
@@ -163,6 +251,7 @@ done:
 ; drawScreen1 - Copy low res graphic buffer onto screen1
 ;               with an offset of Y into the buffer.
 ;               Y range 0..127, wraps at the end of the buffer
+;               Also samples paddle 0 into paddleTaps (see paddleTap)
 ;
 ; This can be used to simulate horizontal scrolling
 ;-----------------------------------------------------------------------------
@@ -171,6 +260,12 @@ done:
 
     ; Pass in offset in Y, range 0 .. 127
     ldx     #0
+
+    ; Start paddle timer, sampled at passes PADDLE_TAP_1 and PADDLE_TAP_2
+    stx     paddleTaps
+    lda     #PADDLE_TAP_1
+    sta     tapCompare
+    bit     GCRESET             ; read (also clears IIc VBL flag)
 
 loop:
     lda     background+$000,y
@@ -227,9 +322,16 @@ loop:
     and     #LEVEL_WIDTH-1      ; wrap around the level
     tay
     inx
+    cpx     tapCompare          ; next tap, or 40 when done
+    beq     tap
+    jmp     loop
+
+tap:
     cpx     #40
     beq     done
+    jsr     paddleTap
     jmp     loop
+
 done:
     rts
 .endproc
@@ -238,6 +340,7 @@ done:
 ; drawScreen2 - Copy low res graphic buffer onto screen2
 ;               with an offset of Y into the buffer.
 ;               Y range 0..127, wraps at the end of the buffer
+;               Also samples paddle 0 into paddleTaps (see paddleTap)
 ;
 ; Same as drawScreen1, but for page 2 (double buffering)
 ;-----------------------------------------------------------------------------
@@ -246,6 +349,12 @@ done:
 
     ; Pass in offset in Y, range 0 .. 127
     ldx     #0
+
+    ; Start paddle timer, sampled at passes PADDLE_TAP_1 and PADDLE_TAP_2
+    stx     paddleTaps
+    lda     #PADDLE_TAP_1
+    sta     tapCompare
+    bit     GCRESET             ; read (also clears IIc VBL flag)
 
 loop:
     lda     background+$000,y
@@ -302,9 +411,16 @@ loop:
     and     #LEVEL_WIDTH-1      ; wrap around the level
     tay
     inx
+    cpx     tapCompare          ; next tap, or 40 when done
+    beq     tap
+    jmp     loop
+
+tap:
     cpx     #40
     beq     done
+    jsr     paddleTap
     jmp     loop
+
 done:
     rts
 .endproc
@@ -314,7 +430,7 @@ done:
 ; drawPlayer
 ;
 ; Draw a single pixel at PLAYER_SCREEN_X, playerYHi
-; using playerColorTop / Bottom (Y even = top pixel, Y odd = bottom pixel)
+; in COLOR_PLAYER (Y even = top pixel, Y odd = bottom pixel)
 ; Can draw to either page based on screenPage value ($00 or $04)
 ; Uses screenPtr0/1 for indexing to screen
 ;-----------------------------------------------------------------------------
@@ -339,17 +455,16 @@ done:
     bne     odd
 
     ; Even Y = top pixel of the cell = low nibble
+    ; (white is all 1 bits, so ORA alone sets it and keeps the other pixel)
     lda     (screenPtr0),y
-    and     #$F0                ; keep bottom pixel
-    ora     playerColorTop
+    ora     #COLOR_PLAYER
     sta     (screenPtr0),y
     rts
 
 odd:
     ; Odd Y = bottom pixel of the cell = high nibble
     lda     (screenPtr0),y
-    and     #$0F                ; keep top pixel
-    ora     playerColorBottom
+    ora     #COLOR_PLAYER << 4
     sta     (screenPtr0),y
     rts
 
@@ -359,10 +474,11 @@ odd:
 ; isSolid
 ;
 ; Read the pixel at level column X, row Y in the background buffer
-; Returns carry set if the pixel is non-zero (solid)
+; Returns the pixel color (0..15) in A, carry set if it isn't
+; levelBgColor (solid)
 ; Column wraps at LEVEL_WIDTH
-; Rows >= PLAYFIELD_HEIGHT (including $FF) return carry clear
-; Preserves X and Y, clobbers A
+; Rows >= PLAYFIELD_HEIGHT (including $FF) return levelBgColor / carry clear
+; Preserves X and Y
 ; Uses mapPtr0/1 for indexing to background
 ;
 ; Reads the buffer, not the screen, so it doesn't depend on what has
@@ -373,23 +489,13 @@ odd:
 
     cpy     #PLAYFIELD_HEIGHT
     bcc     inRange
+    lda     levelBgColor
     clc                         ; carry clear = open
     rts
 
 inRange:
     sty     isSolidRow
-
-    ; Set mapPtr to start of text row (Y/2) in background
-    ; Rows are $80 bytes and background is page aligned, so
-    ; page = Y/4, offset = $80 if text row is odd
-    lda     #0
-    sta     mapPtr0
-    tya
-    lsr
-    lsr                         ; A = Y/4, carry = text row odd
-    ror     mapPtr0             ; $80 if odd, carry now 0
-    adc     #>background
-    sta     mapPtr1
+    jsr     setMapPtr
 
     txa
     and     #LEVEL_WIDTH-1      ; wrap around the level
@@ -405,11 +511,112 @@ inRange:
 
 odd:
     ; Odd Y = bottom pixel of the cell = high nibble
-    and     #$F0
+    lsr
+    lsr
+    lsr
+    lsr
 
 test:
-    cmp     #1                  ; carry set if non-zero
-    ldy     isSolidRow          ; restore Y (carry unchanged)
+    ldy     isSolidRow          ; restore Y
+    cmp     levelBgColor
+    beq     open
+    sec                         ; carry set = solid
+    rts
+open:
+    clc                         ; carry clear = open
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; setMapPtr
+;
+; Point mapPtr0/1 at the start of the text row holding pixel row Y
+; in background
+; Rows are $80 bytes and background is page aligned, so
+; page = Y/4, offset = $80 if text row is odd
+; Preserves X and Y, clobbers A
+;-----------------------------------------------------------------------------
+
+.proc   setMapPtr
+
+    lda     #0
+    sta     mapPtr0
+    tya
+    lsr
+    lsr                         ; A = Y/4, carry = text row odd
+    ror     mapPtr0             ; $80 if odd, carry now 0
+    adc     #>background
+    sta     mapPtr1
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; setPixel
+;
+; Set the pixel at level column X, row Y in the background buffer
+; to color A (0..15)
+; Column wraps at LEVEL_WIDTH
+; Preserves X and Y
+; Uses mapPtr0/1 for indexing to background
+;-----------------------------------------------------------------------------
+
+.proc   setPixel
+
+    sta     pixelColor
+    sty     pixelRow
+    jsr     setMapPtr
+
+    txa
+    and     #LEVEL_WIDTH-1      ; wrap around the level
+    tay
+    lda     pixelRow
+    lsr                         ; carry = odd row
+    bcs     odd
+
+    ; Even Y = top pixel of the cell = low nibble
+    lda     (mapPtr0),y
+    and     #$F0                ; keep bottom pixel
+    ora     pixelColor
+    sta     (mapPtr0),y
+    ldy     pixelRow
+    rts
+
+odd:
+    ; Odd Y = bottom pixel of the cell = high nibble
+    lda     pixelColor
+    asl
+    asl
+    asl
+    asl
+    sta     pixelColor
+    lda     (mapPtr0),y
+    and     #$0F                ; keep top pixel
+    ora     pixelColor
+    sta     (mapPtr0),y
+    ldy     pixelRow
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; playerIsSolid
+;
+; isSolid for the player: same inputs and outputs, but also counts
+; spike hits in playerHitSpike (checked at the end of playerUpdate)
+;-----------------------------------------------------------------------------
+
+.proc   playerIsSolid
+
+    jsr     isSolid
+    bcc     done                ; open
+    cmp     levelSpikeColor
+    bne     solid
+    inc     playerHitSpike      ; doesn't change A or carry
+solid:
+    sec
+done:
     rts
 
 .endproc
@@ -417,7 +624,7 @@ test:
 ;-----------------------------------------------------------------------------
 ; Player movement and table driven jump
 ;
-; Call playerInit once, then playerUpdate once per game tick (30 ticks/sec)
+; Call playerInit once, then playerUpdate once per game tick (60 ticks/sec)
 ; after inputState / inputPrev have been updated.
 ;
 ; Position is 8.8 fixed point:
@@ -431,15 +638,26 @@ test:
 ; needs to be checked for collision.
 ;-----------------------------------------------------------------------------
 
-FRAMES_PER_TICK     = 2         ; 60Hz / 2 = 30 ticks/sec (jump table rate)
-STICK_LEFT          = $40       ; paddle below this = left
-STICK_RIGHT         = $C0       ; paddle at or above this = right
+MACHINE_IIE         = 0         ; machineType values
+MACHINE_IIC         = 1
+MACHINE_IIGS        = 2
+PADDLE_TAP_1        = 4         ; drawScreen pass to sample paddle (~1/3)
+PADDLE_TAP_2        = 8         ; drawScreen pass to sample paddle (~2/3)
 PLAYER_START_X      = 2         ; level column
 PLAYER_START_Y      = 43        ; standing on the ground (row 44)
 PLAYER_SCREEN_X     = 20        ; middle of the screen
 
 LEVEL_WIDTH         = 128       ; background buffer width (power of 2)
 PLAYFIELD_HEIGHT    = 48        ; full screen low-res
+
+COLOR_PLAYER        = $F        ; white (must be $F: drawPlayer only ORs it)
+
+OBJ_NONE            = 0         ; objType values (empty slot)
+OBJ_HPLAT           = 1         ; horizontal moving platform
+OBJ_VPLAT           = 2         ; vertical moving platform
+OBJ_MAX             = 16        ; capacity of each obj* table
+
+PLAT_TICKS          = 12        ; ticks per move (5 cells/sec)
 
 INPUT_LEFT          = %00000001 ; inputState bits (held, not presses)
 INPUT_RIGHT         = %00000010
@@ -448,17 +666,17 @@ INPUT_JUMP          = %00000100
 FLAG_GROUND         = %10000000 ; standing on something (test with BIT/BMI)
 FLAG_RISING         = %01000000 ; early in jump, release can cut it
 
-ACCEL               = $16       ; ~4 ticks to top speed
-DECEL               = $10       ; ~6 ticks to stop
-MAX_VX              = $55       ; 0.33 cells/tick
+ACCEL               = $06       ; ~8 ticks to top speed (133ms)
+DECEL               = $04       ; ~11 ticks to stop (183ms)
+MAX_VX              = $2B       ; 0.17 cells/tick (5 cells/sec)
 
-JUMP_LEN            = 18        ; entries in jumpVelLo/Hi
-CUT_IDX             = 5         ; early release skips to this index
-FALL_IDX            = 9         ; first falling entry: walk-offs, head bumps
-COYOTE_TICKS        = 3         ; grace period to jump after walking off ledge
-BUFFER_TICKS        = 4         ; how early a press before landing counts
+JUMP_LEN            = 35        ; entries in jumpVelLo/Hi
+CUT_IDX             = 11        ; early release skips here (first VY >= -0.2)
+FALL_IDX            = 19        ; first falling entry: walk-offs, head bumps
+COYOTE_TICKS        = 6         ; grace period to jump after walking off ledge
+BUFFER_TICKS        = 8         ; how early a press before landing counts
 NOT_JUMPING         = $FF       ; playerJumpIdx value while grounded
-TERMINAL_VY         = $0100     ; +1.0 rows/tick
+TERMINAL_VY         = $0080     ; +0.5 rows/tick
 
 ;-----------------------------------------------------------------------------
 ; playerInit
@@ -491,6 +709,8 @@ TERMINAL_VY         = $0100     ; +1.0 rows/tick
 ; playerUpdate
 ;
 ; Run one game tick
+; Touching a spike (moving into, landing on, standing on or bumping into
+; one) during the tick calls onSpikeDeath at the end
 ;-----------------------------------------------------------------------------
 
 .proc   playerUpdate
@@ -499,7 +719,16 @@ TERMINAL_VY         = $0100     ; +1.0 rows/tick
     jsr     playerMoveX
     jsr     playerCheckWalkOff
     jsr     playerHandleJump
-    jmp     playerStepY         ; tail call
+    jsr     playerStepY
+
+    ; Spike touched this tick (including being pushed by a platform)?
+    lda     playerHitSpike
+    beq     done
+    lda     #0
+    sta     playerHitSpike
+    jmp     onSpikeDeath        ; tail call
+done:
+    rts
 
 .endproc
 
@@ -600,7 +829,7 @@ pos:
 
     tax
     ldy     playerYHi
-    jsr     isSolid
+    jsr     playerIsSolid
     bcs     blocked
 
 commit:
@@ -640,7 +869,7 @@ setLo:
     ldx     playerXHi
     ldy     playerYHi
     iny
-    jsr     isSolid
+    jsr     playerIsSolid
     bcs     done
     lda     playerFlags
     and     #<~FLAG_GROUND
@@ -726,7 +955,7 @@ done:
 ;-----------------------------------------------------------------------------
 ; playerStepY
 ;
-; While airborne, add this tick's table velocity (or +1.0 past the end)
+; While airborne, add this tick's table velocity (or TERMINAL_VY past the end)
 ; to 8.8 Y. When the row would change, check the new cell:
 ; below -> land, above -> head bump
 ; Uses tempZP / temp2ZP for the new Y
@@ -741,7 +970,7 @@ done:
     bcc     table
     lda     #<TERMINAL_VY       ; past the end: terminal velocity
     ldy     #>TERMINAL_VY
-    bne     haveVY              ; always (Y = 1)
+    jmp     haveVY
 table:
     inc     playerJumpIdx
     lda     jumpVelLo,x
@@ -763,7 +992,7 @@ haveVY:
     ; Entering the row below
     tay
     ldx     playerXHi
-    jsr     isSolid
+    jsr     playerIsSolid
     bcs     land
     jsr     commit
     lda     playerYHi
@@ -777,7 +1006,7 @@ up:
     beq     bump
     tay
     ldx     playerXHi
-    jsr     isSolid
+    jsr     playerIsSolid
     bcs     bump
 
 commit:
@@ -814,11 +1043,399 @@ bump:                           ; stay in this row at its top edge
 .endproc
 
 ;-----------------------------------------------------------------------------
+; Level objects
+;
+; objCount entries in the obj* tables (one table per field, OBJ_MAX
+; capacity each). objType selects what the fields mean:
+;
+;   OBJ_HPLAT  horizontal moving platform
+;       objX, objY      left edge column, row
+;       objWidth        width in pixels
+;       objColor        color (0..15)
+;       objMin, objMax  left edge column path limits
+;       objDir          1 = right, $FF = left
+;
+;   OBJ_VPLAT  vertical moving platform
+;       objX, objY      left edge column, row
+;       objWidth        width in pixels
+;       objColor        color (0..15)
+;       objMin, objMax  row path limits (top, bottom)
+;       objDir          1 = down, $FF = up
+;
+; Platforms are 1 pixel high strips drawn into the background buffer,
+; so isSolid and drawScreen see them with no extra work. They move 1
+; pixel every PLAT_TICKS ticks, turning around at each end of the path.
+;
+; Paths must only cross empty (levelBgColor) pixels, since moving erases
+; to levelBgColor, and must not wrap past column 127.
+;-----------------------------------------------------------------------------
+
+;-----------------------------------------------------------------------------
+; initObjects
+;
+; Draw every object (type not OBJ_NONE) at its starting position, as an
+; objWidth strip in objColor
+;-----------------------------------------------------------------------------
+
+.proc   initObjects
+
+    lda     #PLAT_TICKS
+    sta     platTimer
+
+    ldx     objCount
+loop:
+    dex
+    bmi     done
+    stx     objIndex
+    lda     objType,x
+    beq     next                ; OBJ_NONE: empty slot
+    lda     objColor,x
+    jsr     drawObjRow
+next:
+    ldx     objIndex
+    jmp     loop
+done:
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; moveObjects
+;
+; Call once per tick, before playerUpdate
+;-----------------------------------------------------------------------------
+
+.proc   moveObjects
+
+    dec     platTimer
+    bne     done
+    lda     #PLAT_TICKS
+    sta     platTimer
+
+    ldx     objCount
+loop:
+    dex
+    bmi     done
+    stx     objIndex
+    lda     objType,x
+    cmp     #OBJ_HPLAT
+    bne     notHPlat
+    jsr     moveHPlat
+    jmp     next
+notHPlat:
+    cmp     #OBJ_VPLAT
+    bne     next
+    jsr     moveVPlat
+next:
+    ldx     objIndex
+    jmp     loop
+done:
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; moveHPlat
+;
+; Move platform X (= objIndex) one column, carrying a rider and pushing
+; the player if the leading edge moves into them (crushed if no room)
+;-----------------------------------------------------------------------------
+
+.proc   moveHPlat
+
+    ; Turn around at the ends of the path
+    lda     objX,x
+    ldy     objDir,x
+    bmi     checkLeft
+    cmp     objMax,x
+    bcc     rider
+    lda     #$FF                ; at right end, go left
+    sta     objDir,x
+    jmp     rider
+checkLeft:
+    cmp     objMin,x
+    beq     turnRight
+    bcs     rider
+turnRight:
+    lda     #1                  ; at left end, go right
+    sta     objDir,x
+
+rider:
+    jsr     checkRider
+
+    ; Find the leading (new) and trailing (old) columns and move
+    lda     objDir,x
+    bmi     moveLeft
+
+    lda     objX,x              ; moving right
+    sta     platTrail           ; old left edge
+    clc
+    adc     objWidth,x
+    and     #LEVEL_WIDTH-1
+    sta     platLead            ; one past old right edge
+    lda     objX,x
+    clc
+    adc     #1
+    sta     objX,x
+    jmp     push
+
+moveLeft:
+    lda     objX,x
+    sec
+    sbc     #1
+    and     #LEVEL_WIDTH-1
+    sta     objX,x
+    sta     platLead            ; one before old left edge
+    clc
+    adc     objWidth,x
+    and     #LEVEL_WIDTH-1
+    sta     platTrail           ; old right edge
+
+    ; Push the player if the leading edge moves into their cell
+push:
+    lda     objY,x
+    cmp     playerYHi
+    bne     draw
+    lda     platLead
+    cmp     playerXHi
+    bne     draw
+    lda     objDir,x
+    jsr     movePlayerX
+    bcc     draw
+    jsr     onCrushDeath        ; no room to push
+
+    ; Erase the trailing pixel, draw the leading pixel
+draw:
+    ldx     objIndex
+    lda     objColor,x
+    sta     platColor
+    ldy     objY,x
+    ldx     platTrail
+    lda     levelBgColor
+    jsr     setPixel
+    ldx     platLead
+    lda     platColor
+    jsr     setPixel
+
+    ; Carry the rider
+    lda     platRider
+    beq     done
+    ldx     objIndex
+    lda     objDir,x
+    jmp     movePlayerX         ; tail call (blocked = scraped off)
+done:
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; moveVPlat
+;
+; Move platform X (= objIndex) one row
+;   Up:   anything in the new row (a rider, or an airborne player the
+;         platform rises into) is pushed up first, crushed if no room.
+;         A pushed airborne player lands on it as they fall.
+;   Down: a player in the new row (under it) is pushed down first,
+;         crushed if no room. The platform is redrawn before the rider
+;         follows, so the rider stays grounded.
+;-----------------------------------------------------------------------------
+
+.proc   moveVPlat
+
+    ; Turn around at the ends of the path
+    lda     objY,x
+    ldy     objDir,x
+    bmi     checkTop
+    cmp     objMax,x
+    bcc     move
+    lda     #$FF                ; at bottom, go up
+    sta     objDir,x
+    jmp     move
+checkTop:
+    cmp     objMin,x
+    beq     turnDown
+    bcs     move
+turnDown:
+    lda     #1                  ; at top, go down
+    sta     objDir,x
+
+move:
+    lda     objDir,x
+    bmi     moveUp
+
+    ; Moving down
+    jsr     checkRider          ; before the platform moves
+    lda     objY,x
+    clc
+    adc     #1
+    jsr     playerInSpan        ; player under the new row?
+    bcc     downDraw
+    lda     #1
+    jsr     movePlayerY
+    bcc     downDraw
+    jsr     onCrushDeath        ; no room to push
+downDraw:
+    ldx     objIndex
+    lda     levelBgColor
+    jsr     drawObjRow          ; erase old row
+    inc     objY,x
+    lda     objColor,x
+    jsr     drawObjRow          ; draw new row
+    lda     platRider
+    beq     done
+    lda     #1
+    jmp     movePlayerY         ; tail call
+
+    ; Moving up
+moveUp:
+    lda     objY,x
+    sec
+    sbc     #1
+    jsr     playerInSpan        ; player in the new row?
+    bcc     upDraw
+    lda     #$FF
+    jsr     movePlayerY
+    bcc     upDraw
+    jsr     onCrushDeath        ; no room to push
+upDraw:
+    ldx     objIndex
+    lda     levelBgColor
+    jsr     drawObjRow          ; erase old row
+    dec     objY,x
+    lda     objColor,x
+    jsr     drawObjRow          ; draw new row
+done:
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; checkRider
+;
+; Set platRider non-zero if the player is grounded on top of object X
+; Preserves X
+;-----------------------------------------------------------------------------
+
+.proc   checkRider
+
+    lda     #0
+    sta     platRider
+    bit     playerFlags
+    bpl     done                ; airborne
+    ldy     objY,x
+    dey
+    tya                         ; row above the platform
+    jsr     playerInSpan
+    bcc     done
+    inc     platRider
+done:
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; playerInSpan
+;
+; Carry set if the player is in row A and within the width of object X
+; Preserves X
+;-----------------------------------------------------------------------------
+
+.proc   playerInSpan
+
+    cmp     playerYHi
+    bne     outside
+    lda     playerXHi
+    sec
+    sbc     objX,x              ; column within the object
+    and     #LEVEL_WIDTH-1
+    cmp     objWidth,x          ; carry clear if inside
+    bcs     outside
+    sec
+    rts
+outside:
+    clc
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; drawObjRow
+;
+; Draw object X's row (objWidth pixels at objX, objY) in color A
+; Returns with X = objIndex
+;-----------------------------------------------------------------------------
+
+.proc   drawObjRow
+
+    sta     platColor
+    lda     objWidth,x
+    sta     platPixels
+    ldy     objY,x
+    lda     objX,x
+    tax
+loop:
+    lda     platColor
+    jsr     setPixel
+    inx
+    dec     platPixels
+    bne     loop
+    ldx     objIndex
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; movePlayerX
+;
+; Move the player one column in direction A (1 or $FF) if the cell is
+; open. Returns carry set if blocked. Spikes count (playerIsSolid).
+;-----------------------------------------------------------------------------
+
+.proc   movePlayerX
+
+    clc
+    adc     playerXHi
+    and     #LEVEL_WIDTH-1
+    tax
+    ldy     playerYHi
+    jsr     playerIsSolid
+    bcs     blocked
+    stx     playerXHi
+blocked:
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; movePlayerY
+;
+; Move the player one row in direction A (1 = down, $FF = up) if the
+; cell is open. Returns carry set if blocked. Spikes count, and the top
+; and bottom of the playfield count as blocked.
+;-----------------------------------------------------------------------------
+
+.proc   movePlayerY
+
+    clc
+    adc     playerYHi
+    cmp     #PLAYFIELD_HEIGHT   ; off the top ($FF) or bottom?
+    bcs     blocked             ; (carry set)
+    tay
+    ldx     playerXHi
+    jsr     playerIsSolid
+    bcs     blocked
+    sty     playerYHi
+blocked:
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
 ; Player event hooks (sound, stats, etc)
 ;
 ; May clobber A, X and Y
-; onLanded, onHeadBump and onPitDeath are tail called, so they return
-; straight to playerUpdate's caller
+; onLanded, onHeadBump and onPitDeath are tail called from playerStepY,
+; onSpikeDeath is tail called from playerUpdate
 ;-----------------------------------------------------------------------------
 
 .proc   onJumpStart
@@ -841,15 +1458,28 @@ bump:                           ; stay in this row at its top edge
     jmp     playerInit          ; tail call
 .endproc
 
+.proc   onSpikeDeath
+    jmp     onPitDeath          ; same respawn for now
+.endproc
+
+.proc   onCrushDeath
+    jmp     onPitDeath          ; same respawn for now
+.endproc
+
 ;-----------------------------------------------------------------------------
-; Data
+; Global Data
 ;-----------------------------------------------------------------------------
 
+machineType:    .byte   MACHINE_IIE     ; set by initMachine
 screenPage:     .byte   $00     ; Either $00 or $04 to add to line page
 scrollOffset:   .byte   0       ; buffer column at left edge, 0..127
 
 inputState:     .byte   0       ; INPUT_* bits held this tick
 inputPrev:      .byte   0       ; INPUT_* bits held last tick
+
+paddleTaps:     .byte   1       ; taps paddle 0 was still running (0..2)
+tapCompare:     .byte   0       ; drawScreen pass for next paddle tap
+paddleInput:    .byte   INPUT_LEFT, 0, INPUT_RIGHT  ; indexed by paddleTaps
 
 playerXHi:      .byte   20      ; level column 0..127 (drives scrolling)
 playerXLo:      .byte   0       ; subpixel (1/256 cell)
@@ -862,247 +1492,53 @@ playerFlags:    .byte   FLAG_GROUND     ; FLAG_GROUND | FLAG_RISING
 playerJumpIdx:  .byte   NOT_JUMPING     ; next jumpVel entry
 playerCoyote:   .byte   0       ; ticks left to jump after walking off ledge
 playerJumpBuffer:   .byte   0   ; ticks left on a buffered jump press
+playerHitSpike: .byte   0       ; non-zero if a spike was touched this tick
 
 isSolidRow:     .byte   0       ; isSolid saves Y here
+pixelColor:     .byte   0       ; setPixel color (shifted for odd rows)
+pixelRow:       .byte   0       ; setPixel saves Y here
 
-playerColorTop:     .byte   $0F     ; top pixel (low nibble)
-playerColorBottom:  .byte   $F0     ; bottom pixel (high nibble)
+platTimer:      .byte   0       ; ticks until the next platform move
+objIndex:       .byte   0       ; object being processed
+platPixels:     .byte   0       ; pixels left to draw (drawObjRow)
+platColor:      .byte   0       ; color being drawn (drawObjRow)
+platLead:       .byte   0       ; column being drawn (moveHPlat)
+platTrail:      .byte   0       ; column being erased (moveHPlat)
+platRider:      .byte   0       ; non-zero if the player rides this one
 
-; Jump table B: Y velocity per tick, signed 8.8 (rows/tick)
-; Generated from: v0 = -1.0, rise gravity $001A while VY < 0,
-; fall gravity $0026 while VY >= 0, clamped at +1.0.
-; Per tick: VY += g, clamp, Y += VY.
-; Full jump = 18 ticks, peaks 5 rows up, lands on the start row.
+; Jump table B (60 ticks/sec): Y velocity per tick, signed 8.8 (rows/tick)
+; Same arc as the 30Hz table: per tick velocity halved, gravity quartered.
+; Generated from: v0 = -0.5, rise gravity $001A/4 while VY < 0,
+; fall gravity $0026/4 while VY >= 0, clamped at +0.5.
+; Per tick: VY += g, clamp, Y += VY. Simulated exactly, then each entry
+; rounded to 8.8.
+; Full jump = 35 ticks, peaks 5 rows up, lands on the start row.
 ; Regenerate from new constants to re-tune; don't hand edit.
 
-;                   tick: 0   1   2   3   4   5   6   7   8
-jumpVelLo:      .byte   $1A,$34,$4E,$68,$82,$9C,$B6,$D0,$EA
-;                   tick: 9  10  11  12  13  14  15  16  17
-                .byte   $04,$2A,$50,$76,$9C,$C2,$E8,$00,$00
-jumpVelHi:      .byte   $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
-                .byte   $00,$00,$00,$00,$00,$00,$00,$01,$01
+;                   tick: 0   1   2   3   4   5   6   7   8   9  10  11
+jumpVelLo:      .byte   $86,$8D,$94,$9A,$A0,$A7,$AE,$B4,$BA,$C1,$C8,$CE
+;                   tick: 12 13  14  15  16  17  18  19  20  21  22  23
+                .byte   $D4,$DB,$E2,$E8,$EE,$F5,$FC,$02,$0C,$15,$1E,$28
+;                   tick: 24 25  26  27  28  29  30  31  32  33  34
+                .byte   $32,$3B,$44,$4E,$58,$61,$6A,$74,$7E,$80,$80
+jumpVelHi:      .byte   $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                .byte   $FF,$FF,$FF,$FF,$FF,$FF,$FF,$00,$00,$00,$00,$00
+                .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+jumpVelEnd:
 
-.align  256
-; Example level: 128 x 48 pixels, 24 text rows of $80 bytes
-; Each byte = top pixel (low nibble) + bottom pixel (high nibble)
-; Columns 127 and 0 line up so the level wraps
-background:
-    ; text row 0 (pixel rows 0, 1)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 1 (pixel rows 2, 3)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 2 (pixel rows 4, 5)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 3 (pixel rows 6, 7)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 4 (pixel rows 8, 9)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 5 (pixel rows 10, 11)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 6 (pixel rows 12, 13)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 7 (pixel rows 14, 15)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 8 (pixel rows 16, 17)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 9 (pixel rows 18, 19)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 10 (pixel rows 20, 21)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 11 (pixel rows 22, 23)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$D0,$D0,$D0
-    .byte   $D0,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 12 (pixel rows 24, 25)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 13 (pixel rows 26, 27)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$90,$90,$90,$90,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 14 (pixel rows 28, 29)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$D0,$D0,$D0,$D0,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 15 (pixel rows 30, 31)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$90
-    .byte   $90,$90,$90,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 16 (pixel rows 32, 33)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 17 (pixel rows 34, 35)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$90,$90,$90,$90,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$09,$09,$09,$09,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 18 (pixel rows 36, 37)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 19 (pixel rows 38, 39)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$90
-    .byte   $90,$90,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$01
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$90,$90,$90,$90,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 20 (pixel rows 40, 41)
-    .byte   $00,$00,$00,$00,$00,$09,$09,$09,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$03,$03,$03,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$99,$99,$00,$00,$03,$03,$03,$03,$03
-    .byte   $00,$00,$01,$01,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 21 (pixel rows 42, 43)
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$90,$90,$00,$00,$99,$99
-    .byte   $00,$00,$00,$00,$00,$00,$00,$99,$99,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $88,$88,$88,$88,$88,$88,$88,$88,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
-    ; text row 22 (pixel rows 44, 45)
-    .byte   $8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$00,$00,$00,$8C,$8C,$8C
-    .byte   $8C,$8C,$8C,$8C,$8C,$00,$00,$00,$00,$8C,$8C,$8C,$8C,$8C,$8C,$8C
-    .byte   $00,$00,$00,$00,$00,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C
-    .byte   $00,$00,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C
-    .byte   $00,$00,$00,$00,$00,$00,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C
-    .byte   $88,$88,$88,$88,$88,$88,$88,$88,$00,$00,$00,$00,$8C,$8C,$8C,$8C
-    .byte   $8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C,$8C
-    .byte   $8C,$8C,$8C,$8C,$8C,$8C,$00,$00,$00,$8C,$8C,$8C,$8C,$8C,$8C,$8C
-    ; text row 23 (pixel rows 46, 47)
-    .byte   $88,$88,$88,$88,$88,$88,$88,$88,$88,$88,$00,$00,$00,$88,$88,$88
-    .byte   $88,$88,$88,$88,$88,$00,$00,$00,$00,$88,$88,$88,$88,$88,$88,$88
-    .byte   $00,$00,$00,$00,$00,$88,$88,$88,$88,$88,$88,$88,$88,$88,$88,$88
-    .byte   $00,$00,$88,$88,$88,$88,$88,$88,$88,$88,$88,$88,$88,$88,$88,$88
-    .byte   $00,$00,$00,$00,$00,$00,$88,$88,$88,$88,$88,$88,$88,$88,$88,$88
-    .byte   $88,$88,$88,$88,$88,$88,$88,$88,$00,$00,$00,$00,$88,$88,$88,$88
-    .byte   $88,$88,$88,$88,$88,$88,$88,$88,$88,$88,$88,$88,$88,$88,$88,$88
-    .byte   $88,$88,$88,$88,$88,$88,$00,$00,$00,$88,$88,$88,$88,$88,$88,$88
+.assert jumpVelHi - jumpVelLo = JUMP_LEN, error, "jumpVelLo length != JUMP_LEN"
+.assert jumpVelEnd - jumpVelHi = JUMP_LEN, error, "jumpVelHi length != JUMP_LEN"
+
+;-----------------------------------------------------------------------------
+; Level Data
+;-----------------------------------------------------------------------------
+
+; Generated from images\level1.png by imageConvert.py --level (see build.bat):
+; levelBgColor, levelSpikeColor, objCount, the obj* tables (see "Level
+; objects" above) and background
+
+.align 256
+.include "level1.asm"
 
 ;-----------------------------------------------------------------------------
 ; Lookup Tables
