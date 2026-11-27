@@ -49,15 +49,23 @@ APPLE2_PALETTE = [
 #               on solid ground, and replace its bottom pixel with this
 #               marker. The bottom pixel is where the player respawns.
 #               (At least 2 pixels high, so the color can be seen above it)
+#   MARK_LEDGE  crumbling ledge: draw a 1 pixel high row in its color and
+#               replace the pixel at one end with this marker. The color is
+#               taken from the pixel next to the marker (so only one side
+#               of the marker may be a color), and the marker becomes part
+#               of the ledge. At least 2 pixels wide.
 #   MARK_PATH   moving platform path: fill the pixels the platform sweeps
 #               that it doesn't start on. The shape sets the direction:
 #                 horizontal: a single row on the platform's row, beside it
 #                 vertical:   a rectangle exactly as wide as the platform,
 #                             directly above and/or below it
 #
-# White (COLOR_WHITE) is reserved for the player: the level must have
-# exactly one white pixel, which marks the player start (standing on
-# something solid).
+# Player start: the level must have exactly one lone white (COLOR_WHITE)
+# pixel, i.e. with no white among its 8 neighbors. It becomes background.
+# White pixels touching other white pixels are ordinary level pixels
+# (e.g. highlights). With nothing solid under the start the player starts
+# falling (e.g. dropping in at the top of a level); it just can't be
+# standing on a spike.
 #
 # A platform is a strip of one color, 1 pixel high, touching its path.
 # Each connected blob of path pixels belongs to one platform (a platform
@@ -76,10 +84,12 @@ MARK_BG    = (128, 255, 0  )    # chartreuse
 MARK_SPIKE = (0,   128, 128)    # teal
 MARK_CHECK = (192, 0,   0  )    # red
 MARK_PATH  = (0,   255, 255)    # cyan
+MARK_LEDGE = (255, 0,   128)    # rose
 
-MARKERS = {MARK_BG: 'bg', MARK_SPIKE: 'spike', MARK_CHECK: 'check', MARK_PATH: 'path'}
+MARKERS = {MARK_BG: 'bg', MARK_SPIKE: 'spike', MARK_CHECK: 'check', MARK_PATH: 'path',
+           MARK_LEDGE: 'ledge'}
 
-COLOR_WHITE = 0xF                # reserved for the player, marks the start
+COLOR_WHITE = 0xF                # a lone white pixel marks the player start
 
 LEVEL_W, LEVEL_H = 128, 48
 OBJ_TABLE_SIZE = 16                     # entries in each obj* table (fixed)
@@ -155,6 +165,19 @@ def find_marker(pix, marker, name=None):
     if len(found) != 1:
         raise LevelError(f"need exactly one {name or marker} marker pixel, found {len(found)}: {found}")
     return found[0]
+
+
+def find_start(pix):
+    """Position of the single lone white pixel (no white among its 8 neighbors)"""
+    def white(x, y):
+        return 0 <= x < LEVEL_W and 0 <= y < LEVEL_H and pix[y][x] == COLOR_WHITE
+    lone = [(x, y) for y in range(LEVEL_H) for x in range(LEVEL_W)
+            if white(x, y) and not any(white(x + dx, y + dy)
+                                       for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy)]
+    if len(lone) != 1:
+        raise LevelError(f"need exactly one lone white pixel (player start), found "
+                         f"{len(lone)}: {lone}")
+    return lone[0]
 
 
 def find_color_marker(pix, marker):
@@ -279,14 +302,13 @@ def convert_level(infile, outfile):
     (spx, spy), spike = find_color_marker(pix, 'spike')
     if spike == bg:
         raise LevelError("spike color is the same as the background color")
-    startX, startY = find_marker(pix, COLOR_WHITE, "white (player start; white is only for the player)")
+    startX, startY = find_start(pix)
     pix[bgy][bgx] = bg
     pix[spy][spx] = spike       # the marker is a spike too
     pix[startY][startX] = bg
-    below = pix[startY + 1][startX] if startY + 1 < LEVEL_H else bg
-    if below in (bg, spike) or not isinstance(below, int):
-        raise LevelError(f"player start ({startX},{startY}) must be standing on solid "
-                         f"ground (not background, a spike or a marker)")
+    if startY + 1 < LEVEL_H and pix[startY + 1][startX] == spike:
+        raise LevelError(f"player start ({startX},{startY}) is standing on a spike "
+                         f"(the player would die on every respawn)")
 
     objects = []    # dicts with the obj* fields
 
@@ -306,6 +328,27 @@ def convert_level(infile, outfile):
             pix[row][x] = bg
         objects.append(dict(type='OBJ_CHECKPOINT', x=x, y=y, width=1, color=color,
                             min=top, max=y, dir=0))
+
+    # Crumbling ledges (cleared to background before looking for paths)
+    for x, y in [(x, y) for y in range(LEVEL_H) for x in range(LEVEL_W) if pix[y][x] == 'ledge']:
+        def color_at(cx):
+            if 0 <= cx < LEVEL_W and isinstance(pix[y][cx], int) and pix[y][cx] != bg:
+                return pix[y][cx]
+            return None
+        sides = [step for step in (-1, 1) if color_at(x + step) is not None]
+        if len(sides) != 1:
+            raise LevelError(f"ledge marker at ({x},{y}) needs its ledge color on exactly one "
+                             f"side (found {len(sides)})")
+        step = sides[0]
+        color = color_at(x + step)
+        end = x + step
+        while color_at(end + step) == color:
+            end += step
+        x0, x1 = min(x, end), max(x, end)
+        for cx in range(x0, x1 + 1):
+            pix[y][cx] = bg
+        objects.append(dict(type='OBJ_LEDGE', x=x0, y=y, width=x1 - x0 + 1, color=color,
+                            min=0, max=0, dir=0))
 
     # Moving platforms
     objects += find_platforms(pix, bg)

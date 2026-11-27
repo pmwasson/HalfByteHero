@@ -155,6 +155,8 @@ done:
 ;   IIc:  RDVBLBAR bit 7 is set by the VBL interrupt and cleared by
 ;         reading PTRIG ($C070), which drawScreen1/2 do every frame
 ;         when they start the paddle timer
+; Plays the current sound while waiting (soundStep), then advances it
+; one tick (soundTick)
 ;-----------------------------------------------------------------------------
 
 .proc   waitVBL
@@ -165,24 +167,135 @@ done:
     beq     iigs
 
 iic:
+    jsr     soundStep
     lda     RDVBLBAR
     bpl     iic                 ; wait for VBL interrupt flag
-    rts
+    jmp     soundTick           ; tail call
 
 iie:
     lda     RDVBLBAR
     bpl     iie                 ; in blank, wait for it to end
 iieBlank:
+    jsr     soundStep
     lda     RDVBLBAR
     bmi     iieBlank            ; drawing, wait for blank to start
-    rts
+    jmp     soundTick           ; tail call
 
 iigs:
     lda     RDVBLBAR
     bmi     iigs                ; in blank, wait for it to end
 iigsBlank:
+    jsr     soundStep
     lda     RDVBLBAR
     bpl     iigsBlank           ; drawing, wait for blank to start
+    jmp     soundTick           ; tail call
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; Sound
+;
+; One sound plays at a time, in the spare time at the end of each frame:
+; waitVBL calls soundStep in its wait loop (delay half a period, toggle
+; the speaker) so sound never costs a frame. The tone is gated at 60Hz,
+; which gives it a buzzy 8 bit sound.
+;
+; Each sound is a start pitch, a slide added to the pitch every tick and
+; a length in ticks (soundPitchTable / soundSlideTable / soundTicksTable).
+; playSound replaces whatever is playing; playSoundIfIdle only starts if
+; nothing else is playing (for sounds restarted every tick, like riding).
+;
+; Pitch is a delay count: half period = ~5 * pitch + 30 cycles. Keep it
+; <= ~200 so waitVBL notices vertical blank quickly enough.
+;-----------------------------------------------------------------------------
+
+SND_JUMP            = 0         ; sound numbers (rows in the sound tables)
+SND_LAND            = 1
+SND_RIDE            = 2
+SND_CRACK           = 3
+SND_CRUMBLE         = 4
+SND_DEATH           = 5
+SND_CHECKPOINT      = 6
+SND_BUMP            = 7
+SND_LEVEL           = 8
+
+;-----------------------------------------------------------------------------
+; playSound
+;
+; Start sound A, replacing the current one
+; Clobbers A and X
+;-----------------------------------------------------------------------------
+
+.proc   playSound
+
+    sta     soundId
+    tax
+    lda     soundPitchTable,x
+    sta     soundPitch
+    lda     soundSlideTable,x
+    sta     soundSlide
+    lda     soundTicksTable,x
+    sta     soundTicks
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; playSoundIfIdle
+;
+; Start (or restart) sound A only if nothing is playing or sound A is
+; already playing
+; Clobbers A and X
+;-----------------------------------------------------------------------------
+
+.proc   playSoundIfIdle
+
+    ldx     soundTicks
+    beq     playSound           ; nothing playing
+    cmp     soundId
+    beq     playSound           ; restart the same sound
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; soundStep
+;
+; If a sound is playing, wait half a period then toggle the speaker
+; Called repeatedly from the waitVBL loops
+; Clobbers A and X
+;-----------------------------------------------------------------------------
+
+.proc   soundStep
+
+    lda     soundTicks
+    beq     done                ; silent
+    ldx     soundPitch
+delay:
+    dex                         ; 5 cycles per count
+    bne     delay
+    sta     SPEAKER             ; toggle
+done:
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; soundTick
+;
+; Once per frame: count the current sound down and slide its pitch
+;-----------------------------------------------------------------------------
+
+.proc   soundTick
+
+    lda     soundTicks
+    beq     done
+    dec     soundTicks
+    lda     soundPitch
+    clc
+    adc     soundSlide
+    sta     soundPitch
+done:
     rts
 
 .endproc
@@ -654,6 +767,16 @@ OBJ_NONE            = 0         ; objType values (empty slot)
 OBJ_HPLAT           = 1         ; horizontal moving platform
 OBJ_VPLAT           = 2         ; vertical moving platform
 OBJ_CHECKPOINT      = 3         ; checkpoint column (new respawn point)
+OBJ_LEDGE           = 4         ; crumbling ledge
+
+LEDGE_FLASH         = 4         ; ticks white when first stepped on
+LEDGE_SOLID         = 36        ; then ticks in its own color
+LEDGE_WARN          = 20        ; then ticks white before it falls
+LEDGE_T_COLOR       = 1 + LEDGE_FLASH           ; timer values (see updateLedge)
+LEDGE_T_WARN        = LEDGE_T_COLOR + LEDGE_SOLID
+LEDGE_T_GONE        = LEDGE_T_WARN + LEDGE_WARN ; 61: gone ~1 sec after stepping
+                                                ; on, back after 256 - 61 ticks
+.assert LEDGE_T_GONE < 256, error, "ledge timing doesn't fit the 8 bit timer"
 
 PLAT_TICKS          = 12        ; ticks per move (5 cells/sec)
 
@@ -679,8 +802,9 @@ TERMINAL_VY         = $0080     ; +0.5 rows/tick
 ;-----------------------------------------------------------------------------
 ; playerInit
 ;
-; Place the player standing at column X, row Y
-; Caller must make sure (X, Y+1) is solid
+; Place the player at column X, row Y, standing if (X, Y+1) is solid,
+; otherwise falling from rest (top of a jump arc, no coyote time), e.g.
+; dropping in at the top of a new level
 ;-----------------------------------------------------------------------------
 
 .proc   playerInit
@@ -695,9 +819,20 @@ TERMINAL_VY         = $0080     ; +0.5 rows/tick
     sta     playerVYHi
     sta     playerCoyote
     sta     playerJumpBuffer
+
+    iny                         ; anything to stand on?
+    jsr     isSolid
+    bcc     falling
     lda     #FLAG_GROUND
     sta     playerFlags
     lda     #NOT_JUMPING
+    sta     playerJumpIdx
+    rts
+
+falling:
+    lda     #0
+    sta     playerFlags
+    lda     #FALL_IDX
     sta     playerJumpIdx
     rts
 
@@ -1070,6 +1205,14 @@ bump:                           ; stay in this row at its top edge
 ;       base the new respawn point, erases it and calls checkpointReached.
 ;       Its type is then set to OBJ_NONE.
 ;
+;   OBJ_LEDGE  crumbling ledge (1 pixel high)
+;       objX, objY      left edge column, row
+;       objWidth        width in pixels
+;       objColor        color (0..15)
+;       objMin          timer, 0 = armed (see updateLedge)
+;       Standing on it makes it flash white, return to its color, flash
+;       white again and disappear, then reappear later.
+;
 ; Objects are drawn into the background buffer, so isSolid and drawScreen
 ; see them with no extra work. Platforms are 1 pixel high strips. They move 1
 ; pixel every PLAT_TICKS ticks, turning around at each end of the path.
@@ -1430,10 +1573,9 @@ done:
 ;-----------------------------------------------------------------------------
 ; checkObjects
 ;
-; Call once per tick, after playerUpdate
-; A checkpoint is touched when the player is in the column beside it
-; (or its own column) from 1 row above its top down to its base. The
-; column is solid, so walking into it or landing on it counts.
+; Call once per tick, after playerUpdate: touches and timers for the
+; objects that react to the player (checkpoints, crumbling ledges, and
+; the ride sound each time a moving platform carrying the player moves)
 ;-----------------------------------------------------------------------------
 
 .proc   checkObjects
@@ -1442,9 +1584,48 @@ done:
 loop:
     dex
     bmi     done
+    stx     objIndex
     lda     objType,x
     cmp     #OBJ_CHECKPOINT
-    bne     loop
+    bne     notCheckpoint
+    jsr     touchCheckpoint
+    jmp     next
+notCheckpoint:
+    cmp     #OBJ_LEDGE
+    bne     notLedge
+    jsr     updateLedge
+    jmp     next
+notLedge:
+    cmp     #OBJ_HPLAT
+    beq     platform
+    cmp     #OBJ_VPLAT
+    bne     next
+platform:
+    lda     platTimer           ; moveObjects just moved the platforms?
+    cmp     #PLAT_TICKS
+    bne     next
+    jsr     checkRider          ; riding: tick in time with the moves
+    lda     platRider
+    beq     next
+    lda     #SND_RIDE
+    jsr     playSoundIfIdle
+next:
+    ldx     objIndex
+    jmp     loop
+done:
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; touchCheckpoint
+;
+; Checkpoint X (= objIndex) is touched when the player is in the column
+; beside it (or its own column) from 1 row above its top down to its
+; base. The column is solid, so walking into it or landing on it counts.
+;-----------------------------------------------------------------------------
+
+.proc   touchCheckpoint
 
     lda     playerXHi           ; within 1 column of objX?
     sec
@@ -1453,22 +1634,83 @@ loop:
     adc     #1                  ; -1..1 -> 0..2
     and     #LEVEL_WIDTH-1
     cmp     #3
-    bcs     loop
+    bcs     done
     ldy     playerYHi           ; playerYHi + 1 >= objMin?
     iny
     tya
     cmp     objMin,x
-    bcc     loop
+    bcc     done
     lda     objY,x              ; playerYHi <= objY?
     cmp     playerYHi
-    bcc     loop
-
-    stx     objIndex
-    jsr     reachCheckpoint
-    ldx     objIndex
-    jmp     loop
+    bcc     done
+    jmp     reachCheckpoint     ; tail call
 done:
     rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; updateLedge
+;
+; Crumbling ledge X (= objIndex). objMin is its timer, 0 = armed.
+; Standing on it starts the timer (1), then it counts up every tick:
+;   1                   white (first flash)
+;   LEDGE_T_COLOR       own color
+;   LEDGE_T_WARN        white (about to fall)
+;   LEDGE_T_GONE        erased (background)
+;   wraps to 0          drawn again and re-armed, unless the player is in
+;                       its row and span: then it waits at $FF
+;-----------------------------------------------------------------------------
+
+.proc   updateLedge
+
+    lda     objMin,x
+    bne     running
+    jsr     checkRider          ; armed: is the player standing on it?
+    lda     platRider
+    beq     done
+    lda     #1                  ; start the timer
+    sta     objMin,x
+    jmp     white
+
+running:
+    clc
+    adc     #1
+    beq     reappear            ; wrapped
+    sta     objMin,x
+    cmp     #LEDGE_T_COLOR
+    beq     ownColor
+    cmp     #LEDGE_T_WARN
+    beq     white
+    cmp     #LEDGE_T_GONE
+    beq     gone
+done:
+    rts
+
+ownColor:
+    lda     objColor,x
+    jmp     drawObjRow          ; tail call
+white:
+    lda     #SND_CRACK
+    jsr     playSound
+    ldx     objIndex
+    lda     #COLOR_PLAYER
+    jmp     drawObjRow          ; tail call
+gone:
+    lda     #SND_CRUMBLE
+    jsr     playSound
+    ldx     objIndex
+    lda     levelBgColor
+    jmp     drawObjRow          ; tail call
+
+reappear:
+    lda     objY,x              ; don't reappear on top of the player
+    jsr     playerInSpan
+    bcs     done                ; timer stays $FF, try again next tick
+    lda     #0                  ; armed
+    sta     objMin,x
+    lda     objColor,x
+    jmp     drawObjRow          ; tail call
 
 .endproc
 
@@ -1613,21 +1855,26 @@ loop:
 ;-----------------------------------------------------------------------------
 
 .proc   onJumpStart
-    rts
+    lda     #SND_JUMP
+    jmp     playSound           ; tail call
 .endproc
 
 .proc   onLanded
-    rts
+    lda     #SND_LAND
+    jmp     playSound           ; tail call
 .endproc
 
 .proc   onHeadBump
-    rts
+    lda     #SND_BUMP
+    jmp     playSound           ; tail call
 .endproc
 
 .proc   advanceLevel
     ; Fell off the bottom of the screen: start the next level
     ; (after the last level, back to level 0)
     ; Must not leave playerYHi >= PLAYFIELD_HEIGHT for drawPlayer
+    lda     #SND_LEVEL
+    jsr     playSound
     ldx     currentLevel
     inx
     cpx     #LEVEL_COUNT
@@ -1639,10 +1886,14 @@ start:
 .endproc
 
 .proc   onSpikeDeath
+    lda     #SND_DEATH
+    jsr     playSound
     jmp     respawnPlayer       ; tail call
 .endproc
 
 .proc   onCrushDeath
+    lda     #SND_DEATH
+    jsr     playSound
     jmp     respawnPlayer       ; tail call
 .endproc
 
@@ -1656,7 +1907,8 @@ start:
 
 .proc   checkpointReached
     ; Called after a checkpoint is erased and playerStartX/Y updated
-    rts
+    lda     #SND_CHECKPOINT
+    jmp     playSound           ; tail call
 .endproc
 
 ;-----------------------------------------------------------------------------
@@ -1690,6 +1942,26 @@ playerStartX:   .byte   0       ; respawn column (level start or checkpoint)
 playerStartY:   .byte   0       ; respawn row
 
 currentLevel:   .byte   0       ; stored level that is active (0 = title)
+
+soundId:        .byte   0       ; SND_* playing (valid while soundTicks > 0)
+soundTicks:     .byte   0       ; ticks left, 0 = silent
+soundPitch:     .byte   0       ; delay count (half period ~5 * n + 30 cycles)
+soundSlide:     .byte   0       ; added to soundPitch every tick (signed)
+
+; Sound tables, indexed by SND_*
+;                       jump    land    ride    crack   crumble death   checkpoint  bump    level
+soundPitchTable:.byte   40,     120,    180,    30,     60,     100,    80,         150,    180
+soundSlideTable:.byte   <-2,    8,      0,      6,      10,     6,      <-4,        10,     <-8
+soundTicksTable:.byte   10,     4,      2,      4,      12,     16,     16,         3,      20
+; jump: ~2.2KHz rising, land: ~800Hz falling thud, ride: ~520Hz tick each
+; platform move, crack: ~2.8KHz short (ledge stepped on / about to fall),
+; crumble: ~1.5KHz falling to ~550Hz (ledge gone), death: ~940Hz falling
+; to ~520Hz (spikes, crushed), checkpoint: ~1.2KHz rising to ~3.6KHz,
+; bump: ~640Hz short dull thunk (head hits ceiling), level: ~520Hz
+; rising to ~2.9KHz (fell into the next level)
+SOUND_COUNT = * - soundTicksTable
+.assert soundTicksTable - soundSlideTable = SOUND_COUNT, error, "sound tables differ in length"
+.assert soundSlideTable - soundPitchTable = SOUND_COUNT, error, "sound tables differ in length"
 
 isSolidRow:     .byte   0       ; isSolid saves Y here
 pixelColor:     .byte   0       ; setPixel color (shifted for odd rows)
