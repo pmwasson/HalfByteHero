@@ -17,11 +17,9 @@
 .proc   main
 
     jsr     initMachine
-    jsr     initObjects
 
-    ldx     #PLAYER_START_X
-    ldy     #PLAYER_START_Y
-    jsr     playerInit
+    lda     #0                  ; level 0 is the title page
+    jsr     startLevel
 
     ; Fill page 2 first so the first frame shown isn't garbage
     jsr     updateScrollOffset
@@ -45,7 +43,7 @@
 ; Draw a full frame on the hidden page, wait for vsync, then show it
 ; and switch to drawing the other page. Loops forever.
 ;
-; Order per page: input, objects, player update, scroll to the player,
+; Order per page: input, move objects, player update, object touches, scroll to the player,
 ; background, then draw the player on top.
 ;-----------------------------------------------------------------------------
 
@@ -56,6 +54,7 @@ loop:
     jsr     readInput
     jsr     moveObjects
     jsr     playerUpdate
+    jsr     checkObjects
     jsr     updateScrollOffset
     jsr     drawScreen1
     jsr     drawPlayer
@@ -68,6 +67,7 @@ loop:
     jsr     readInput
     jsr     moveObjects
     jsr     playerUpdate
+    jsr     checkObjects
     jsr     updateScrollOffset
     jsr     drawScreen2
     jsr     drawPlayer
@@ -643,8 +643,6 @@ MACHINE_IIC         = 1
 MACHINE_IIGS        = 2
 PADDLE_TAP_1        = 4         ; drawScreen pass to sample paddle (~1/3)
 PADDLE_TAP_2        = 8         ; drawScreen pass to sample paddle (~2/3)
-PLAYER_START_X      = 2         ; level column
-PLAYER_START_Y      = 43        ; standing on the ground (row 44)
 PLAYER_SCREEN_X     = 20        ; middle of the screen
 
 LEVEL_WIDTH         = 128       ; background buffer width (power of 2)
@@ -655,7 +653,7 @@ COLOR_PLAYER        = $F        ; white (must be $F: drawPlayer only ORs it)
 OBJ_NONE            = 0         ; objType values (empty slot)
 OBJ_HPLAT           = 1         ; horizontal moving platform
 OBJ_VPLAT           = 2         ; vertical moving platform
-OBJ_MAX             = 16        ; capacity of each obj* table
+OBJ_CHECKPOINT      = 3         ; checkpoint column (new respawn point)
 
 PLAT_TICKS          = 12        ; ticks per move (5 cells/sec)
 
@@ -998,7 +996,7 @@ haveVY:
     lda     playerYHi
     cmp     #PLAYFIELD_HEIGHT
     bcc     done
-    jmp     onPitDeath          ; tail call
+    jmp     advanceLevel        ; tail call (fell off the bottom)
 
     ; Entering the row above
 up:
@@ -1045,8 +1043,9 @@ bump:                           ; stay in this row at its top edge
 ;-----------------------------------------------------------------------------
 ; Level objects
 ;
-; objCount entries in the obj* tables (one table per field, OBJ_MAX
-; capacity each). objType selects what the fields mean:
+; objCount entries in the obj* tables (one table per field, 16 entries
+; each in every level so levels can overlay). objType selects what the
+; fields mean:
 ;
 ;   OBJ_HPLAT  horizontal moving platform
 ;       objX, objY      left edge column, row
@@ -1062,8 +1061,17 @@ bump:                           ; stay in this row at its top edge
 ;       objMin, objMax  row path limits (top, bottom)
 ;       objDir          1 = down, $FF = up
 ;
-; Platforms are 1 pixel high strips drawn into the background buffer,
-; so isSolid and drawScreen see them with no extra work. They move 1
+;   OBJ_CHECKPOINT  1 pixel wide column standing on the ground
+;       objX            column
+;       objY            base row (where the player respawns)
+;       objMin          top row
+;       objColor        color (0..15)
+;       Touching it (beside it or on top, see checkObjects) makes the
+;       base the new respawn point, erases it and calls checkpointReached.
+;       Its type is then set to OBJ_NONE.
+;
+; Objects are drawn into the background buffer, so isSolid and drawScreen
+; see them with no extra work. Platforms are 1 pixel high strips. They move 1
 ; pixel every PLAT_TICKS ticks, turning around at each end of the path.
 ;
 ; Paths must only cross empty (levelBgColor) pixels, since moving erases
@@ -1073,8 +1081,8 @@ bump:                           ; stay in this row at its top edge
 ;-----------------------------------------------------------------------------
 ; initObjects
 ;
-; Draw every object (type not OBJ_NONE) at its starting position, as an
-; objWidth strip in objColor
+; Draw every object (type not OBJ_NONE) at its starting position in
+; objColor: checkpoints as a column, everything else as an objWidth strip
 ;-----------------------------------------------------------------------------
 
 .proc   initObjects
@@ -1089,8 +1097,14 @@ loop:
     stx     objIndex
     lda     objType,x
     beq     next                ; OBJ_NONE: empty slot
+    cmp     #OBJ_CHECKPOINT
+    beq     column
     lda     objColor,x
     jsr     drawObjRow
+    jmp     next
+column:
+    lda     objColor,x
+    jsr     drawObjColumn
 next:
     ldx     objIndex
     jmp     loop
@@ -1385,6 +1399,100 @@ loop:
 .endproc
 
 ;-----------------------------------------------------------------------------
+; drawObjColumn
+;
+; Draw object X's column (objX, rows objMin..objY) in color A
+; Returns with X = objIndex
+;-----------------------------------------------------------------------------
+
+.proc   drawObjColumn
+
+    sta     platColor
+    ldy     objMin,x
+    lda     objX,x
+    tax
+loop:
+    lda     platColor
+    jsr     setPixel
+    tya
+    ldx     objIndex
+    cmp     objY,x
+    beq     done                ; base drawn
+    iny
+    lda     objX,x
+    tax
+    jmp     loop
+done:
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; checkObjects
+;
+; Call once per tick, after playerUpdate
+; A checkpoint is touched when the player is in the column beside it
+; (or its own column) from 1 row above its top down to its base. The
+; column is solid, so walking into it or landing on it counts.
+;-----------------------------------------------------------------------------
+
+.proc   checkObjects
+
+    ldx     objCount
+loop:
+    dex
+    bmi     done
+    lda     objType,x
+    cmp     #OBJ_CHECKPOINT
+    bne     loop
+
+    lda     playerXHi           ; within 1 column of objX?
+    sec
+    sbc     objX,x
+    clc
+    adc     #1                  ; -1..1 -> 0..2
+    and     #LEVEL_WIDTH-1
+    cmp     #3
+    bcs     loop
+    ldy     playerYHi           ; playerYHi + 1 >= objMin?
+    iny
+    tya
+    cmp     objMin,x
+    bcc     loop
+    lda     objY,x              ; playerYHi <= objY?
+    cmp     playerYHi
+    bcc     loop
+
+    stx     objIndex
+    jsr     reachCheckpoint
+    ldx     objIndex
+    jmp     loop
+done:
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; reachCheckpoint
+;
+; Make checkpoint X (= objIndex) the respawn point, erase it and remove it
+;-----------------------------------------------------------------------------
+
+.proc   reachCheckpoint
+
+    lda     objX,x
+    sta     playerStartX
+    lda     objY,x
+    sta     playerStartY
+    lda     levelBgColor
+    jsr     drawObjColumn       ; erase
+    lda     #OBJ_NONE
+    sta     objType,x
+    jmp     checkpointReached   ; tail call
+
+.endproc
+
+;-----------------------------------------------------------------------------
 ; movePlayerX
 ;
 ; Move the player one column in direction A (1 or $FF) if the cell is
@@ -1431,11 +1539,77 @@ blocked:
 .endproc
 
 ;-----------------------------------------------------------------------------
+; Levels
+;
+; The game runs on the active level (levelData..levelDataEnd: the level
+; colors, start, obj* tables and background). Stored levels have the same
+; layout and size, so starting a level copies a stored one over it. This
+; also undoes anything the last level changed (moved platforms, erased
+; checkpoints).
+;
+; Level 0 is the title page, the game levels start at 1. Falling off the
+; bottom of the screen advances to the next level (advanceLevel).
+;-----------------------------------------------------------------------------
+
+;-----------------------------------------------------------------------------
+; startLevel
+;
+; Make stored level A the active level, draw its objects and put the
+; player at its start
+;-----------------------------------------------------------------------------
+
+.proc   startLevel
+
+    sta     currentLevel
+    jsr     copyLevel
+    jsr     initObjects
+    ldx     levelStartX         ; respawn here until a checkpoint is reached
+    stx     playerStartX
+    ldy     levelStartY
+    sty     playerStartY
+    jmp     playerInit          ; tail call
+
+.endproc
+
+;-----------------------------------------------------------------------------
+; copyLevel
+;
+; Copy stored level A (0..LEVEL_COUNT-1) over the active level
+; Levels are page aligned and LEVEL_PAGES pages long
+; Uses mapPtr0/1 (source) and screenPtr0/1 (destination)
+;-----------------------------------------------------------------------------
+
+.proc   copyLevel
+
+    tax
+    lda     levelPage,x
+    sta     mapPtr1
+    lda     #>levelData
+    sta     screenPtr1
+    ldy     #0
+    sty     mapPtr0
+    sty     screenPtr0
+    ldx     #LEVEL_PAGES
+loop:
+    lda     (mapPtr0),y
+    sta     (screenPtr0),y
+    iny
+    bne     loop
+    inc     mapPtr1             ; next page
+    inc     screenPtr1
+    dex
+    bne     loop
+    rts
+
+.endproc
+
+;-----------------------------------------------------------------------------
 ; Player event hooks (sound, stats, etc)
 ;
 ; May clobber A, X and Y
-; onLanded, onHeadBump and onPitDeath are tail called from playerStepY,
-; onSpikeDeath is tail called from playerUpdate
+; onLanded, onHeadBump and advanceLevel are tail called from playerStepY,
+; onSpikeDeath is tail called from playerUpdate,
+; checkpointReached is tail called from reachCheckpoint
 ;-----------------------------------------------------------------------------
 
 .proc   onJumpStart
@@ -1450,20 +1624,39 @@ blocked:
     rts
 .endproc
 
-.proc   onPitDeath
-    ; Respawn (must not leave playerYHi >= PLAYFIELD_HEIGHT for drawPlayer)
-    ; TODO: lose a life
-    ldx     #PLAYER_START_X
-    ldy     #PLAYER_START_Y
-    jmp     playerInit          ; tail call
+.proc   advanceLevel
+    ; Fell off the bottom of the screen: start the next level
+    ; (after the last level, back to level 0)
+    ; Must not leave playerYHi >= PLAYFIELD_HEIGHT for drawPlayer
+    ldx     currentLevel
+    inx
+    cpx     #LEVEL_COUNT
+    bcc     start
+    ldx     #0
+start:
+    txa
+    jmp     startLevel          ; tail call
 .endproc
 
 .proc   onSpikeDeath
-    jmp     onPitDeath          ; same respawn for now
+    jmp     respawnPlayer       ; tail call
 .endproc
 
 .proc   onCrushDeath
-    jmp     onPitDeath          ; same respawn for now
+    jmp     respawnPlayer       ; tail call
+.endproc
+
+.proc   respawnPlayer
+    ; Back to the level start or the last checkpoint reached
+    ; TODO: lose a life
+    ldx     playerStartX
+    ldy     playerStartY
+    jmp     playerInit          ; tail call
+.endproc
+
+.proc   checkpointReached
+    ; Called after a checkpoint is erased and playerStartX/Y updated
+    rts
 .endproc
 
 ;-----------------------------------------------------------------------------
@@ -1493,6 +1686,10 @@ playerJumpIdx:  .byte   NOT_JUMPING     ; next jumpVel entry
 playerCoyote:   .byte   0       ; ticks left to jump after walking off ledge
 playerJumpBuffer:   .byte   0   ; ticks left on a buffered jump press
 playerHitSpike: .byte   0       ; non-zero if a spike was touched this tick
+playerStartX:   .byte   0       ; respawn column (level start or checkpoint)
+playerStartY:   .byte   0       ; respawn row
+
+currentLevel:   .byte   0       ; stored level that is active (0 = title)
 
 isSolidRow:     .byte   0       ; isSolid saves Y here
 pixelColor:     .byte   0       ; setPixel color (shifted for odd rows)
@@ -1529,16 +1726,6 @@ jumpVelEnd:
 .assert jumpVelHi - jumpVelLo = JUMP_LEN, error, "jumpVelLo length != JUMP_LEN"
 .assert jumpVelEnd - jumpVelHi = JUMP_LEN, error, "jumpVelHi length != JUMP_LEN"
 
-;-----------------------------------------------------------------------------
-; Level Data
-;-----------------------------------------------------------------------------
-
-; Generated from images\level1.png by imageConvert.py --level (see build.bat):
-; levelBgColor, levelSpikeColor, objCount, the obj* tables (see "Level
-; objects" above) and background
-
-.align 256
-.include "level1.asm"
 
 ;-----------------------------------------------------------------------------
 ; Lookup Tables
@@ -1596,3 +1783,35 @@ linePage:
     .byte   >$06D0      ; 21
     .byte   >$0750      ; 22
     .byte   >$07D0      ; 23
+
+;-----------------------------------------------------------------------------
+; Level Data
+;-----------------------------------------------------------------------------
+
+; Each generated level file starts with .align 256 and is the same size
+; (levelData..levelDataEnd). See "Levels" above.
+
+; Active level: global labels (levelBgColor, objX, background, ...) used by
+; the game. Starts as a copy of level 0; startLevel copies over it.
+.include "level0.asm"
+
+LEVEL_PAGES = (levelDataEnd - levelData) / 256
+.assert <levelData = 0, error, "levelData must be page aligned"
+.assert (levelDataEnd - levelData) .mod 256 = 0, error, "level size must be whole pages"
+
+; Stored levels: each in its own scope so the labels don't clash
+; (e.g. level1Data::levelData)
+
+.proc level0Data
+.include "level0.asm"
+.endproc
+
+.proc level1Data
+.include "level1.asm"
+.endproc
+
+; Start page of each stored level, indexed by level number
+levelPage:
+    .byte   >level0Data::levelData
+    .byte   >level1Data::levelData
+LEVEL_COUNT = * - levelPage

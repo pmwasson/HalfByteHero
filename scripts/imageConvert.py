@@ -42,18 +42,31 @@ APPLE2_PALETTE = [
 # Level marker colors (chosen to look distinct from the 16 Apple II colors)
 #
 #   MARK_BG     one pixel; the pixel to its left is the background color
-#   MARK_SPIKE  one pixel; the pixel to its left is the spike color
-#   MARK_HPATH  horizontal platform path: on the platform's row, fill the
-#               columns the platform sweeps that it doesn't start on
-#   MARK_VPATH  vertical platform path: fill the rows the platform sweeps
-#               (full platform width) that it doesn't start on
+#   MARK_SPIKE  one pixel; the pixel to its left is the spike color. The
+#               marker itself becomes a spike (the spike color), so put it
+#               at the end of a row of spikes
+#   MARK_CHECK  checkpoint: draw a 1 pixel wide column in its color standing
+#               on solid ground, and replace its bottom pixel with this
+#               marker. The bottom pixel is where the player respawns.
+#               (At least 2 pixels high, so the color can be seen above it)
+#   MARK_PATH   moving platform path: fill the pixels the platform sweeps
+#               that it doesn't start on. The shape sets the direction:
+#                 horizontal: a single row on the platform's row, beside it
+#                 vertical:   a rectangle exactly as wide as the platform,
+#                             directly above and/or below it
+#
+# White (COLOR_WHITE) is reserved for the player: the level must have
+# exactly one white pixel, which marks the player start (standing on
+# something solid).
 #
 # A platform is a strip of one color, 1 pixel high, touching its path.
-# It must either have path pixels on both sides, or be the only
-# non-background thing touching its path (so it can be told apart from
-# solid ground at the end of a path).
+# Each connected blob of path pixels belongs to one platform (a platform
+# in the middle of its path has a blob on each side), so different
+# platforms' paths must not touch. If a blob could belong to more than one
+# strip (e.g. a path that ends against solid ground), the platform must
+# have path on both sides so it can be told apart.
 #
-# All markers and platforms become the background color in the data
+# All other markers and platforms become the background color in the data
 # (platforms are drawn by initObjects).
 # Platforms start moving away from the end they're at: right/down
 # (objDir = 1), unless they start at the right/bottom end ($FF).
@@ -61,12 +74,16 @@ APPLE2_PALETTE = [
 
 MARK_BG    = (128, 255, 0  )    # chartreuse
 MARK_SPIKE = (0,   128, 128)    # teal
-MARK_HPATH = (0,   255, 255)    # cyan
-MARK_VPATH = (255, 0,   128)    # rose
+MARK_CHECK = (192, 0,   0  )    # red
+MARK_PATH  = (0,   255, 255)    # cyan
 
-MARKERS = {MARK_BG: 'bg', MARK_SPIKE: 'spike', MARK_HPATH: 'hpath', MARK_VPATH: 'vpath'}
+MARKERS = {MARK_BG: 'bg', MARK_SPIKE: 'spike', MARK_CHECK: 'check', MARK_PATH: 'path'}
+
+COLOR_WHITE = 0xF                # reserved for the player, marks the start
 
 LEVEL_W, LEVEL_H = 128, 48
+OBJ_TABLE_SIZE = 16                     # entries in each obj* table (fixed)
+LEVEL_DATA_SIZE = 0x100 + LEVEL_W * LEVEL_H // 2    # header page + background
 
 
 class LevelError(Exception):
@@ -132,71 +149,127 @@ def read_level(infile):
     return pix
 
 
-def find_color_marker(pix, marker):
-    """Color of the pixel left of the single `marker` pixel; clears the marker"""
+def find_marker(pix, marker, name=None):
+    """Position of the single `marker` pixel"""
     found = [(x, y) for y in range(LEVEL_H) for x in range(LEVEL_W) if pix[y][x] == marker]
     if len(found) != 1:
-        raise LevelError(f"need exactly one {marker} marker pixel, found {len(found)}: {found}")
-    x, y = found[0]
+        raise LevelError(f"need exactly one {name or marker} marker pixel, found {len(found)}: {found}")
+    return found[0]
+
+
+def find_color_marker(pix, marker):
+    """Position of the single `marker` pixel and the color of the pixel left of it"""
+    x, y = find_marker(pix, marker)
     if x == 0 or not isinstance(pix[y][x - 1], int):
         raise LevelError(f"{marker} marker at ({x},{y}) needs an Apple II color to its left")
-    return found[0], pix[y][x - 1]
+    return (x, y), pix[y][x - 1]
 
 
-def runs_of(line):
-    """Split a line into runs of equal values: [value, start, end] (end inclusive)"""
-    runs = []
-    for i, v in enumerate(line):
-        if runs and runs[-1][0] == v:
-            runs[-1][2] = i
-        else:
-            runs.append([v, i, i])
-    return runs
+def path_blobs(pix):
+    """4-connected groups of path pixels, each a set of (x, y)"""
+    seen = set()
+    blobs = []
+    for y in range(LEVEL_H):
+        for x in range(LEVEL_W):
+            if pix[y][x] != 'path' or (x, y) in seen:
+                continue
+            blob = set()
+            todo = [(x, y)]
+            seen.add((x, y))
+            while todo:
+                cx, cy = todo.pop()
+                blob.add((cx, cy))
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if (0 <= nx < LEVEL_W and 0 <= ny < LEVEL_H and (nx, ny) not in seen
+                            and pix[ny][nx] == 'path'):
+                        seen.add((nx, ny))
+                        todo.append((nx, ny))
+            blobs.append(blob)
+    return blobs
 
 
-def find_paths(line, marker, bg, where):
+def find_platforms(pix, bg):
     """
-    Find platforms on one line (a row for hpath, a column for vpath).
-    Returns (platStart, platEnd, color, pathStart, pathEnd) tuples.
+    Match each path blob to the platform strip it belongs to.
+    Returns a list of object dicts (OBJ_HPLAT / OBJ_VPLAT).
     """
-    runs = runs_of(line)
-    n = len(runs)
 
-    def is_marker(i):
-        return 0 <= i < n and runs[i][0] == marker
+    def is_color(x, y):
+        return 0 <= x < LEVEL_W and 0 <= y < LEVEL_H and isinstance(pix[y][x], int) and pix[y][x] != bg
 
-    def is_candidate(i):
-        return 0 <= i < n and isinstance(runs[i][0], int) and runs[i][0] != bg
+    def is_path(x, y):
+        return 0 <= x < LEVEL_W and 0 <= y < LEVEL_H and pix[y][x] == 'path'
 
-    found = []
-    used = set()
+    def strip_at(x, y):
+        """The run of one color along row y through (x, y): (y, x0, x1, color)"""
+        color = pix[y][x]
+        x0, x1 = x, x
+        while x0 > 0 and pix[y][x0 - 1] == color:
+            x0 -= 1
+        while x1 < LEVEL_W - 1 and pix[y][x1 + 1] == color:
+            x1 += 1
+        return (y, x0, x1, color)
 
-    # Platforms with path on both sides
-    for i in range(n):
-        if is_candidate(i) and is_marker(i - 1) and is_marker(i + 1):
-            if i - 1 in used:
-                raise LevelError(f"{where}: two platforms share a {marker} path at {runs[i - 1][1]}")
-            used.update((i - 1, i + 1))
-            found.append((runs[i][1], runs[i][2], runs[i][0], runs[i - 1][1], runs[i + 1][2]))
+    platforms = {}  # (orient, strip) -> [pathMin, pathMax]
 
-    # Platforms at one end of their path
-    for i in range(n):
-        if not is_marker(i) or i in used:
-            continue
-        cands = [j for j in (i - 1, i + 1) if is_candidate(j)]
+    for blob in path_blobs(pix):
+        xs = [p[0] for p in blob]
+        ys = [p[1] for p in blob]
+        bx0, bx1, by0, by1 = min(xs), max(xs), min(ys), max(ys)
+        where = f"path at ({bx0},{by0})..({bx1},{by1})"
+        if len(blob) != (bx1 - bx0 + 1) * (by1 - by0 + 1):
+            raise LevelError(f"{where} must be a single row or a rectangle")
+
+        # (orient, strip, enclosed): strips this blob could belong to
+        cands = []
+        if by0 == by1:
+            # Horizontal: a strip at either end of the row
+            for x, step in ((bx0 - 1, -1), (bx1 + 1, 1)):
+                if is_color(x, by0):
+                    strip = strip_at(x, by0)
+                    far = strip[1] - 1 if step < 0 else strip[2] + 1
+                    cands.append(('H', strip, is_path(far, by0)))
+        # Vertical: a strip exactly as wide as the blob, above or below
+        for y, step in ((by0 - 1, -1), (by1 + 1, 1)):
+            if is_color(bx0, y):
+                strip = strip_at(bx0, y)
+                if strip[1] == bx0 and strip[2] == bx1:
+                    enclosed = all(is_path(x, y + step) for x in range(bx0, bx1 + 1))
+                    cands.append(('V', strip, enclosed))
+
         if not cands:
-            raise LevelError(f"{where}: {marker} path at {runs[i][1]}..{runs[i][2]} has no platform")
+            raise LevelError(f"{where} has no platform touching it (horizontal paths go beside "
+                             f"the platform, vertical paths above/below it at the same width)")
         if len(cands) > 1:
-            raise LevelError(f"{where}: {marker} path at {runs[i][1]}..{runs[i][2]} touches two "
-                             f"colors, can't tell which is the platform (start the platform "
-                             f"inside the path, or leave a background gap at the far end)")
-        j = cands[0]
-        if is_marker(j + (j - i)):
-            raise LevelError(f"{where}: platform at {runs[j][1]} has a path on both sides already")
-        used.add(i)
-        found.append((runs[j][1], runs[j][2], runs[j][0],
-                      min(runs[i][1], runs[j][1]), max(runs[i][2], runs[j][2])))
-    return found
+            cands = [c for c in cands if c[2]]
+            if len(cands) != 1:
+                raise LevelError(f"{where} touches more than one strip that could be its "
+                                 f"platform (put path on both sides of the platform, or leave "
+                                 f"a background gap)")
+        orient, strip, _ = cands[0]
+
+        lo, hi = (bx0, bx1) if orient == 'H' else (by0, by1)
+        lo = min(lo, strip[1] if orient == 'H' else strip[0])
+        hi = max(hi, strip[2] if orient == 'H' else strip[0])
+        other = ('V' if orient == 'H' else 'H', strip)
+        if other in platforms:
+            raise LevelError(f"platform at ({strip[1]},{strip[0]}) has both horizontal and "
+                             f"vertical path touching it")
+        span = platforms.setdefault((orient, strip), [lo, hi])
+        span[0] = min(span[0], lo)
+        span[1] = max(span[1], hi)
+
+    objects = []
+    for (orient, (y, x0, x1, color)), (lo, hi) in platforms.items():
+        width = x1 - x0 + 1
+        if orient == 'H':
+            objMax = hi - width + 1
+            objects.append(dict(type='OBJ_HPLAT', x=x0, y=y, width=width, color=color,
+                                min=lo, max=objMax, dir=0xFF if x0 == objMax else 1))
+        else:
+            objects.append(dict(type='OBJ_VPLAT', x=x0, y=y, width=width, color=color,
+                                min=lo, max=hi, dir=0xFF if y == hi else 1))
+    return objects
 
 
 def convert_level(infile, outfile):
@@ -206,43 +279,43 @@ def convert_level(infile, outfile):
     (spx, spy), spike = find_color_marker(pix, 'spike')
     if spike == bg:
         raise LevelError("spike color is the same as the background color")
+    startX, startY = find_marker(pix, COLOR_WHITE, "white (player start; white is only for the player)")
     pix[bgy][bgx] = bg
-    pix[spy][spx] = bg
+    pix[spy][spx] = spike       # the marker is a spike too
+    pix[startY][startX] = bg
+    below = pix[startY + 1][startX] if startY + 1 < LEVEL_H else bg
+    if below in (bg, spike) or not isinstance(below, int):
+        raise LevelError(f"player start ({startX},{startY}) must be standing on solid "
+                         f"ground (not background, a spike or a marker)")
 
     objects = []    # dicts with the obj* fields
 
-    # Horizontal platforms, row by row
-    for y in range(LEVEL_H):
-        for x0, x1, color, p0, p1 in find_paths(pix[y], 'hpath', bg, f"row {y}"):
-            width = x1 - x0 + 1
-            objMax = p1 - width + 1
-            objects.append(dict(type='OBJ_HPLAT', x=x0, y=y, width=width, color=color,
-                                min=p0, max=objMax, dir=0xFF if x0 == objMax else 1))
+    # Checkpoints (cleared to background before looking for paths)
+    for x, y in [(x, y) for y in range(LEVEL_H) for x in range(LEVEL_W) if pix[y][x] == 'check']:
+        color = pix[y - 1][x] if y > 0 else None
+        if not isinstance(color, int) or color == bg:
+            raise LevelError(f"checkpoint at ({x},{y}) needs its column color above the marker")
+        below = pix[y + 1][x] if y + 1 < LEVEL_H else bg
+        if below in (bg, spike) or not isinstance(below, int):
+            raise LevelError(f"checkpoint at ({x},{y}) must stand on solid ground "
+                             f"(not background, a spike or a marker)")
+        top = y - 1
+        while top > 0 and pix[top - 1][x] == color:
+            top -= 1
+        for row in range(top, y + 1):
+            pix[row][x] = bg
+        objects.append(dict(type='OBJ_CHECKPOINT', x=x, y=y, width=1, color=color,
+                            min=top, max=y, dir=0))
 
-    # Vertical platforms, column by column, then merge matching neighbors
-    cols = []
-    for x in range(LEVEL_W):
-        column = [pix[y][x] for y in range(LEVEL_H)]
-        for y0, y1, color, p0, p1 in find_paths(column, 'vpath', bg, f"column {x}"):
-            if y0 != y1:
-                raise LevelError(f"column {x}: vertical platform at rows {y0}..{y1} is more than 1 pixel high")
-            cols.append((x, y0, color, p0, p1))
-    cols.sort(key=lambda c: (c[1:], c[0]))
-    for x, y, color, p0, p1 in cols:
-        last = objects[-1] if objects else None
-        if (last and last['type'] == 'OBJ_VPLAT' and last['x'] + last['width'] == x
-                and (last['y'], last['color'], last['min'], last['max']) == (y, color, p0, p1)):
-            last['width'] += 1
-        else:
-            objects.append(dict(type='OBJ_VPLAT', x=x, y=y, width=1, color=color,
-                                min=p0, max=p1, dir=0xFF if y == p1 else 1))
+    # Moving platforms
+    objects += find_platforms(pix, bg)
 
     objects.sort(key=lambda o: (o['x'], o['y']))
 
     # Platforms and paths become background in the data
     for y in range(LEVEL_H):
         for x in range(LEVEL_W):
-            if pix[y][x] in ('hpath', 'vpath'):
+            if pix[y][x] == 'path':
                 pix[y][x] = bg
     for o in objects:
         for x in range(o['x'], o['x'] + o['width']):
@@ -254,30 +327,41 @@ def convert_level(infile, outfile):
     out.putdata([pix[y][x] for y in range(LEVEL_H) for x in range(LEVEL_W)])
     out.save(outfile)
 
-    write_level_asm(infile, bg, spike, objects, pix)
+    write_level_asm(infile, bg, spike, startX, startY, objects, pix)
 
 
-def write_level_asm(infile, bg, spike, objects, pix):
+def write_level_asm(infile, bg, spike, startX, startY, objects, pix):
     count = len(objects)
+    if count > OBJ_TABLE_SIZE:
+        raise LevelError(f"{count} objects, the obj* tables only hold {OBJ_TABLE_SIZE}")
     print("; " + "-" * 76)
     print(f"; Level data generated by imageConvert.py --level from {os.path.basename(infile)}")
     print("; Don't edit, edit the PNG")
+    print(";")
+    print(f"; Every level has the same layout and size (${LEVEL_DATA_SIZE:X} bytes, page")
+    print("; aligned), so a stored level can be copied over the active one.")
     print("; " + "-" * 76)
+    print()
+    print(".align  256")
+    print("levelData:")
     print()
     print(f"levelBgColor:   .byte   ${bg:X}")
     print(f"levelSpikeColor:.byte   ${spike:X}")
+    print(f"levelStartX:    .byte   {startX}")
+    print(f"levelStartY:    .byte   {startY}")
     print()
     print(f"objCount:       .byte   {count}")
-    print(f".assert {count} <= OBJ_MAX, error, \"too many objects for OBJ_MAX\"")
     print()
+    print(f"; Each obj* table is padded to {OBJ_TABLE_SIZE} entries")
 
     def table(label, values):
         if values:
-            cols = "".join(f"{v + ',':<12}" for v in values[:-1]) + values[-1]
+            cols = "".join(f"{v + ',':<16}" for v in values[:-1]) + values[-1]
             print(f"{label + ':':<16}.byte   {cols}")
         else:
             print(f"{label + ':'}")
-        print(f"{'':<16}.res    OBJ_MAX-{count}")
+        if count < OBJ_TABLE_SIZE:
+            print(f"{'':<16}.res    {OBJ_TABLE_SIZE - count}")
 
     table("objType", [o['type'] for o in objects])
     table("objX", [str(o['x']) for o in objects])
@@ -299,6 +383,9 @@ def write_level_asm(infile, bg, spike, objects, pix):
         row = [pix[2 * r][x] | (pix[2 * r + 1][x] << 4) for x in range(LEVEL_W)]
         for i in range(0, LEVEL_W, 16):
             print("    .byte   " + ','.join(f"${b:02X}" for b in row[i:i + 16]))
+    print()
+    print("levelDataEnd:")
+    print(f".assert levelDataEnd - levelData = ${LEVEL_DATA_SIZE:X}, error, \"level data size changed\"")
 
 
 def main():

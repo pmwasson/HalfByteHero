@@ -4,6 +4,7 @@ cd ..\build
 :: Convert images
 ::---------------------------------------------------------------------------
 python3 ..\scripts\imageConvert.py ..\images\title.png title.png >  ..\build\title.asm  || exit
+python3 ..\scripts\imageConvert.py --level ..\images\level0.png level0.png >  ..\build\level0.asm  || exit
 python3 ..\scripts\imageConvert.py --level ..\images\level1.png level1.png >  ..\build\level1.asm  || exit
 
 ::---------------------------------------------------------------------------
