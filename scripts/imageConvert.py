@@ -51,9 +51,10 @@ APPLE2_PALETTE = [
 #               (At least 2 pixels high, so the color can be seen above it)
 #   MARK_LEDGE  crumbling ledge: draw a 1 pixel high row in its color and
 #               replace the pixel at one end with this marker. The color is
-#               taken from the pixel next to the marker (so only one side
-#               of the marker may be a color), and the marker becomes part
-#               of the ledge. At least 2 pixels wide.
+#               taken from the pixel next to the marker, and the marker
+#               becomes part of the ledge. At least 2 pixels wide. If both
+#               sides of the marker are colored (e.g. a ledge from wall to
+#               wall), the side that is 1 pixel high is the ledge.
 #   MARK_PATH   moving platform path: fill the pixels the platform sweeps
 #               that it doesn't start on. The shape sets the direction:
 #                 horizontal: a single row on the platform's row, beside it
@@ -71,8 +72,8 @@ APPLE2_PALETTE = [
 # Each connected blob of path pixels belongs to one platform (a platform
 # in the middle of its path has a blob on each side), so different
 # platforms' paths must not touch. If a blob could belong to more than one
-# strip (e.g. a path that ends against solid ground), the platform must
-# have path on both sides so it can be told apart.
+# strip (e.g. a path that ends against a wall), the platform is the strip
+# with path on both sides, or else the only strip that is 1 pixel high.
 #
 # All other markers and platforms become the background color in the data
 # (platforms are drawn by initObjects).
@@ -233,6 +234,12 @@ def find_platforms(pix, bg):
             x1 += 1
         return (y, x0, x1, color)
 
+    def thick_strip(strip):
+        """True if any pixel of the strip has its color directly above or below"""
+        y, x0, x1, color = strip
+        return any(0 <= cy < LEVEL_H and pix[cy][cx] == color
+                   for cx in range(x0, x1 + 1) for cy in (y - 1, y + 1))
+
     platforms = {}  # (orient, strip) -> [pathMin, pathMax]
 
     for blob in path_blobs(pix):
@@ -264,11 +271,19 @@ def find_platforms(pix, bg):
             raise LevelError(f"{where} has no platform touching it (horizontal paths go beside "
                              f"the platform, vertical paths above/below it at the same width)")
         if len(cands) > 1:
-            cands = [c for c in cands if c[2]]
-            if len(cands) != 1:
+            # Prefer a strip with path on both sides, else the only strip
+            # that is 1 pixel high (the others are walls, ground, ...)
+            enclosed = [c for c in cands if c[2]]
+            thin = [c for c in cands if not thick_strip(c[1])]
+            if len(enclosed) == 1:
+                cands = enclosed
+            elif len(thin) == 1:
+                cands = thin
+            else:
+                strips = ", ".join(f"({s[1]}..{s[2]},{s[0]})={s[3]}" for _, s, _ in cands)
                 raise LevelError(f"{where} touches more than one strip that could be its "
-                                 f"platform (put path on both sides of the platform, or leave "
-                                 f"a background gap)")
+                                 f"platform: {strips} (put path on both sides of the "
+                                 f"platform, or leave a background gap)")
         orient, strip, _ = cands[0]
 
         lo, hi = (bx0, bx1) if orient == 'H' else (by0, by1)
@@ -336,9 +351,21 @@ def convert_level(infile, outfile):
                 return pix[y][cx]
             return None
         sides = [step for step in (-1, 1) if color_at(x + step) is not None]
+        if len(sides) == 2:
+            # Touching something on both ends (e.g. wall to wall): a ledge is
+            # 1 pixel high, so rule out a side whose pixel has the same
+            # color directly above or below it
+            def thick(cx):
+                c = pix[y][cx]
+                return any(0 <= cy < LEVEL_H and pix[cy][cx] == c for cy in (y - 1, y + 1))
+            sides = [step for step in sides if not thick(x + step)]
         if len(sides) != 1:
-            raise LevelError(f"ledge marker at ({x},{y}) needs its ledge color on exactly one "
-                             f"side (found {len(sides)})")
+            neighbors = ", ".join(f"({x + s},{y})={pix[y][x + s]}" for s in (-1, 1)
+                                  if 0 <= x + s < LEVEL_W)
+            raise LevelError(f"ledge marker at ({x},{y}): can't tell which side is the ledge "
+                             f"(neighbors {neighbors}). The ledge color must be on one side, "
+                             f"and if both sides are colored the other side must be thicker "
+                             f"than 1 pixel")
         step = sides[0]
         color = color_at(x + step)
         end = x + step

@@ -2082,8 +2082,13 @@ LEVEL_PAGES = (levelDataEnd - levelData) / 256
 .include "level1.asm"
 .endproc
 
+.proc level2Data
+.include "level2.asm"
+.endproc
+
 ; Start page of each stored level, indexed by level number
 levelPage:
     .byte   >level0Data::levelData
     .byte   >level1Data::levelData
+    .byte   >level2Data::levelData
 LEVEL_COUNT = * - levelPage
